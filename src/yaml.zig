@@ -1,234 +1,324 @@
-//! Clash 配置文件中 `proxies:` 区块的轻量解析器。
+//! clash 配置的通用 YAML 解析，基于 vendored libyaml（MIT，见 vendor/libyaml/LICENSE）。
 //!
-//! 只解析本项目需要的 YAML 子集（clash 订阅/配置中常见的节点列表形态）：
+//! 与旧的手写子集解析器不同，这里解析完整 YAML 1.1：
+//! 嵌套 map（ws-opts / reality-opts / headers）、flow 语法（`- {name: x}`）、
+//! 锚点/别名、任意缩进、单双引号、行内注释、CRLF。
 //!
-//! ```yaml
-//! proxies:
-//!   - name: "节点 A"        # 行内注释
-//!     type: ss
-//!     server: 1.2.3.4
-//!     port: 8388
-//!     cipher: aes-256-gcm
-//!     password: 'secret'
-//! ```
+//! 结果是一棵 `Value` 树。所有字符串由调用方提供的 arena 分配，
+//! 生命周期与 arena 一致（无逐节点释放）。
 //!
-//! 支持：缩进列表、`- name: x` 行内首字段、单/双引号、行尾注释、`\r\n` 换行。
-//! 不支持：锚点/别名、内联 flow 语法、多行值、块标量、tab 缩进。
-//!
-//! 所有返回的 key/value 都指向原始输入文本，调用方需保证其生命周期。
+//! 标量一律保留原始文本（数字、布尔也不例外），布尔语义由调用方按需解析，
+//! 避免 YAML 1.1 把 `password: yes` 之类的值误判成布尔而丢失。
 
 const std = @import("std");
+const c = @import("c");
 
-/// 节点的一个字段（如 `name: "节点 A"`）。
-pub const Field = struct {
-    key: []const u8,
-    /// 已去除引号与首尾空白
-    value: []const u8,
+// translate-c 把 yaml_event_type_t 降级为 c_uint，枚举常量则是顶层 c_int。
+// 这里统一为 c_uint 常量便于比较。
+const STREAM_START_EVENT: c_uint = c.YAML_STREAM_START_EVENT;
+const DOCUMENT_START_EVENT: c_uint = c.YAML_DOCUMENT_START_EVENT;
+const DOCUMENT_END_EVENT: c_uint = c.YAML_DOCUMENT_END_EVENT;
+const STREAM_END_EVENT: c_uint = c.YAML_STREAM_END_EVENT;
+const SCALAR_EVENT: c_uint = c.YAML_SCALAR_EVENT;
+const SEQUENCE_START_EVENT: c_uint = c.YAML_SEQUENCE_START_EVENT;
+const SEQUENCE_END_EVENT: c_uint = c.YAML_SEQUENCE_END_EVENT;
+const MAPPING_START_EVENT: c_uint = c.YAML_MAPPING_START_EVENT;
+const MAPPING_END_EVENT: c_uint = c.YAML_MAPPING_END_EVENT;
+const ALIAS_EVENT: c_uint = c.YAML_ALIAS_EVENT;
+
+/// 一个 YAML 值。
+pub const Value = union(enum) {
+    empty,
+    scalar: []const u8,
+    list: []const Value,
+    map: Map,
+
+    pub fn asScalar(self: Value) ?[]const u8 {
+        return switch (self) {
+            .scalar => |s| s,
+            else => null,
+        };
+    }
+
+    pub fn asList(self: Value) ?[]const Value {
+        return switch (self) {
+            .list => |l| l,
+            else => null,
+        };
+    }
+
+    pub fn asMap(self: Value) ?Map {
+        return switch (self) {
+            .map => |m| m,
+            else => null,
+        };
+    }
 };
 
-/// 一个节点（proxies 列表中的一项）。
-pub const Node = struct {
-    fields: []Field,
-};
+pub const Map = std.StringArrayHashMapUnmanaged(Value);
 
 pub const Error = error{
-    /// 输入里没有找到 `proxies:` 区块
-    MissingProxies,
+    /// 事件流结构不符合预期（如根节点是容器结束事件）
+    UnexpectedEvent,
+    /// 引用了未定义的锚点
+    InvalidAnchor,
+    /// libyaml 解析失败（parse 会转成 Document.problem）
+    ParseFailed,
     OutOfMemory,
 };
 
-/// 解析 clash 文本，返回所有节点。
-/// `text` 的生命周期必须覆盖返回结果。
-pub fn parseProxies(allocator: std.mem.Allocator, text: []const u8) Error![]Node {
-    var nodes = std.ArrayList(Node).empty;
-    errdefer {
-        for (nodes.items) |n| allocator.free(n.fields);
-        nodes.deinit(allocator);
+/// 解析结果。`problem` 非空表示解析失败，此时 `root` 无意义。
+pub const Document = struct {
+    root: Value = .empty,
+    problem: ?[]const u8 = null,
+};
+
+/// 解析一段 YAML 文本，返回第一个文档。
+/// 解析失败不返回错误，而是返回带 `problem` 诊断信息的 Document。
+pub fn parse(arena: std.mem.Allocator, source: []const u8) Error!Document {
+    var parser: c.yaml_parser_t = undefined;
+    if (c.yaml_parser_initialize(&parser) == 0) return error.OutOfMemory;
+    defer c.yaml_parser_delete(&parser);
+
+    c.yaml_parser_set_input_string(&parser, source.ptr, source.len);
+
+    var anchors: std.StringHashMapUnmanaged(Value) = .empty;
+
+    return parseBody(&parser, arena, &anchors) catch |err| switch (err) {
+        error.ParseFailed => Document{
+            .problem = problemText(&parser, arena),
+        },
+        else => return err,
+    };
+}
+
+/// libyaml 解析失败时的事件循环主体；`error.ParseFailed` 由 `parse` 统一转换为诊断。
+fn parseBody(parser: *c.yaml_parser_t, arena: std.mem.Allocator, anchors: *std.StringHashMapUnmanaged(Value)) Error!Document {
+    var stream_start: c.yaml_event_t = undefined;
+    try nextEvent(parser, &stream_start);
+    defer c.yaml_event_delete(&stream_start);
+    if (stream_start.type != STREAM_START_EVENT) return error.UnexpectedEvent;
+
+    var doc_start: c.yaml_event_t = undefined;
+    try nextEvent(parser, &doc_start);
+    defer c.yaml_event_delete(&doc_start);
+    if (doc_start.type != DOCUMENT_START_EVENT) return error.UnexpectedEvent;
+
+    const root = switch (try parseNode(parser, arena, anchors)) {
+        .value => |v| v,
+        .end => return error.UnexpectedEvent,
+    };
+
+    var doc_end: c.yaml_event_t = undefined;
+    try nextEvent(parser, &doc_end);
+    defer c.yaml_event_delete(&doc_end);
+    if (doc_end.type != DOCUMENT_END_EVENT) return error.UnexpectedEvent;
+
+    var stream_end: c.yaml_event_t = undefined;
+    try nextEvent(parser, &stream_end);
+    defer c.yaml_event_delete(&stream_end);
+    if (stream_end.type != STREAM_END_EVENT) return error.UnexpectedEvent;
+
+    return .{ .root = root };
+}
+
+const NodeResult = union(enum) {
+    value: Value,
+    /// 容器（sequence/mapping）的结束事件
+    end,
+};
+
+/// 读取下一个事件并构建节点。
+fn parseNode(
+    parser: *c.yaml_parser_t,
+    arena: std.mem.Allocator,
+    anchors: *std.StringHashMapUnmanaged(Value),
+) Error!NodeResult {
+    var ev: c.yaml_event_t = undefined;
+    try nextEvent(parser, &ev);
+    defer c.yaml_event_delete(&ev);
+
+    return switch (ev.type) {
+        SCALAR_EVENT => .{ .value = try scalarValue(arena, anchors, &ev.data.scalar) },
+        SEQUENCE_START_EVENT => .{ .value = try parseSequence(parser, arena, anchors, anchorOf(&ev.data.sequence_start)) },
+        MAPPING_START_EVENT => .{ .value = try parseMapping(parser, arena, anchors, anchorOf(&ev.data.mapping_start)) },
+        ALIAS_EVENT => blk: {
+            const name = std.mem.span(ev.data.alias.anchor);
+            break :blk .{ .value = anchors.get(name) orelse return error.InvalidAnchor };
+        },
+        SEQUENCE_END_EVENT, MAPPING_END_EVENT => .end,
+        else => error.UnexpectedEvent,
+    };
+}
+
+fn scalarValue(
+    arena: std.mem.Allocator,
+    anchors: *std.StringHashMapUnmanaged(Value),
+    sc: anytype,
+) Error!Value {
+    const text = try arena.dupe(u8, sc.value[0..sc.length]);
+    if (sc.anchor) |a| {
+        try anchors.put(arena, try arena.dupe(u8, std.mem.span(a)), .{ .scalar = text });
     }
-
-    var current_fields: ?std.ArrayList(Field) = null;
-    var in_proxies = false;
-
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |raw| {
-        // 去掉 \r（Windows 换行）
-        const line = std.mem.trimEnd(u8, raw, "\r");
-        // 剥离引号外的行尾注释
-        const content = stripComment(line);
-        const trimmed = std.mem.trim(u8, content, " \t");
-        if (trimmed.len == 0) continue;
-
-        const indent = leadingSpaces(content);
-
-        if (!in_proxies) {
-            if (indent == 0 and isProxiesHeader(trimmed)) in_proxies = true;
-            continue;
-        }
-
-        // 遇到下一个顶层 key（缩进 0），proxies 区块结束
-        if (indent == 0) break;
-
-        // 缩进 2 的 `- ...` 开始一个新节点
-        if (indent == 2 and trimmed[0] == '-') {
-            try commitNode(allocator, &nodes, &current_fields);
-            current_fields = std.ArrayList(Field).empty;
-            const rest = std.mem.trimStart(u8, trimmed[1..], " \t");
-            if (rest.len > 0) try appendField(allocator, &current_fields.?, rest);
-            continue;
-        }
-
-        // 缩进 4 的 `key: value` 属于当前节点
-        if (indent == 4 and current_fields != null) {
-            try appendField(allocator, &current_fields.?, trimmed);
-            continue;
-        }
-
-        // 其他缩进（2 但非 `-`、4 但无当前节点等）：忽略
-    }
-
-    // 收尾：提交最后一个节点
-    try commitNode(allocator, &nodes, &current_fields);
-    if (current_fields) |*list| list.deinit(allocator);
-
-    if (nodes.items.len == 0) return error.MissingProxies;
-    return nodes.toOwnedSlice(allocator);
+    return .{ .scalar = text };
 }
 
-/// 把 current_fields 作为节点提交（非空时）。
-fn commitNode(
-    allocator: std.mem.Allocator,
-    nodes: *std.ArrayList(Node),
-    current: *?std.ArrayList(Field),
-) Error!void {
-    if (current.* == null) return;
-    const list = &current.*.?;
-    if (list.items.len == 0) return;
-    try nodes.append(allocator, .{ .fields = try list.toOwnedSlice(allocator) });
-    current.* = null;
-}
-
-/// 解析一行 `key: value`，追加为字段。
-fn appendField(
-    allocator: std.mem.Allocator,
-    list: *std.ArrayList(Field),
-    line: []const u8,
-) Error!void {
-    const colon = findSplitColon(line) orelse return; // 无冒号，忽略
-    const key = std.mem.trim(u8, line[0..colon], " \t");
-    if (key.len == 0) return;
-    const value = unquote(std.mem.trim(u8, line[colon + 1 ..], " \t"));
-    try list.append(allocator, .{ .key = key, .value = value });
-}
-
-/// 找到分隔 `key: value` 的冒号位置：冒号后须为空白或行尾。
-/// 返回行内第一个满足条件的冒号。
-fn findSplitColon(line: []const u8) ?usize {
-    var i: usize = 0;
-    while (i < line.len) : (i += 1) {
-        if (line[i] == ':') {
-            if (i + 1 == line.len or line[i + 1] == ' ' or line[i + 1] == '\t') return i;
+fn parseSequence(
+    parser: *c.yaml_parser_t,
+    arena: std.mem.Allocator,
+    anchors: *std.StringHashMapUnmanaged(Value),
+    anchor: ?[]const u8,
+) Error!Value {
+    var items: std.ArrayListUnmanaged(Value) = .empty;
+    while (true) {
+        switch (try parseNode(parser, arena, anchors)) {
+            .end => break,
+            .value => |v| try items.append(arena, v),
         }
     }
-    return null;
+    const list = try items.toOwnedSlice(arena);
+    if (anchor) |a| {
+        try anchors.put(arena, try arena.dupe(u8, a), .{ .list = list });
+    }
+    return .{ .list = list };
 }
 
-/// 是否 `proxies:` 顶层 key。
-fn isProxiesHeader(trimmed: []const u8) bool {
-    return std.mem.eql(u8, trimmed, "proxies:") or std.mem.startsWith(u8, trimmed, "proxies:");
-}
-
-/// 前导空格数（tab 视为 0，本项目不处理 tab 缩进）。
-fn leadingSpaces(line: []const u8) usize {
-    var n: usize = 0;
-    while (n < line.len and line[n] == ' ') : (n += 1) {}
-    return n;
-}
-
-/// 剥离引号外的 `#` 注释。
-fn stripComment(line: []const u8) []const u8 {
-    var quote: u8 = 0;
-    for (line, 0..) |c, i| {
-        switch (c) {
-            '\'', '"' => {
-                if (quote == 0)
-                    quote = c
-                else if (quote == c)
-                    quote = 0;
+fn parseMapping(
+    parser: *c.yaml_parser_t,
+    arena: std.mem.Allocator,
+    anchors: *std.StringHashMapUnmanaged(Value),
+    anchor: ?[]const u8,
+) Error!Value {
+    var map: Map = .empty;
+    var pending_key: ?[]const u8 = null;
+    while (true) {
+        switch (try parseNode(parser, arena, anchors)) {
+            .end => break,
+            .value => |v| {
+                if (pending_key) |k| {
+                    try map.put(arena, k, v);
+                    pending_key = null;
+                } else {
+                    pending_key = v.asScalar() orelse return error.UnexpectedEvent;
+                }
             },
-            '#' => if (quote == 0) return line[0..i],
-            else => {},
         }
     }
-    return line;
+    if (pending_key != null) return error.UnexpectedEvent;
+    if (anchor) |a| {
+        try anchors.put(arena, try arena.dupe(u8, a), .{ .map = map });
+    }
+    return .{ .map = map };
 }
 
-/// 去掉首尾成对的引号。
-fn unquote(value: []const u8) []const u8 {
-    if (value.len >= 2) {
-        const first = value[0];
-        const last = value[value.len - 1];
-        if ((first == '"' and last == '"') or (first == '\'' and last == '\'')) {
-            return value[1 .. value.len - 1];
-        }
-    }
-    return value;
+/// 从 sequence/mapping 的 start 事件里取锚点（仅事件存活期间有效）。
+fn anchorOf(start: anytype) ?[]const u8 {
+    const a = start.anchor orelse return null;
+    return std.mem.span(a);
+}
+
+fn nextEvent(parser: *c.yaml_parser_t, out: *c.yaml_event_t) Error!void {
+    if (c.yaml_parser_parse(parser, out) == 0) return error.ParseFailed;
+}
+
+/// 提取 libyaml 的失败诊断文本（arena 所有）。
+fn problemText(parser: *c.yaml_parser_t, arena: std.mem.Allocator) ?[]const u8 {
+    const p = parser.problem orelse return null;
+    return arena.dupe(u8, std.mem.span(p)) catch null;
 }
 
 // ---------- tests ----------
 
 const testing = std.testing;
 
-test "parse basic proxies" {
+const ParseError = Error;
+
+test "parse nested maps, flow syntax, comments, crlf" {
     const text =
+        \\mixed-port: 7890
         \\proxies:
-        \\  - name: "节点 A"   # 注释
+        \\  - name: "节点 A"   # 行内注释
         \\    type: ss
         \\    server: 1.2.3.4
         \\    port: 8388
         \\    cipher: aes-256-gcm
-        \\    password: 'secret'
-        \\  - name: trojan-01
-        \\    type: trojan
-        \\    server: 2.2.2.2
-        \\    port: 443
-        \\    password: "p@ss#word"
-        \\    sni: example.com
+        \\    password: 'p@ss#word'
+        \\    ws-opts:
+        \\      path: /ws
+        \\      headers:
+        \\        Host: example.com
+        \\  - { name: flow-node, type: vless, server: 2.2.2.2, port: 443, tls: true, network: ws }
         \\proxy-groups:
         \\  - name: auto
         \\
     ;
-    const nodes = try parseProxies(testing.allocator, text);
-    defer {
-        for (nodes) |n| testing.allocator.free(n.fields);
-        testing.allocator.free(nodes);
-    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    try testing.expectEqual(@as(usize, 2), nodes.len);
-    try testing.expectEqualSlices(u8, "节点 A", getField(nodes[0], "name").?);
-    try testing.expectEqualSlices(u8, "8388", getField(nodes[0], "port").?);
-    // 注释与引号处理
-    try testing.expectEqualSlices(u8, "p@ss#word", getField(nodes[1], "password").?);
-    try testing.expectEqualSlices(u8, "trojan-01", getField(nodes[1], "name").?);
+    const doc = try parse(arena, text);
+    try testing.expect(doc.problem == null);
+
+    const root = doc.root.asMap().?;
+    const proxies = root.get("proxies").?.asList().?;
+    try testing.expectEqual(@as(usize, 2), proxies.len);
+
+    // 嵌套 ws-opts.headers
+    const p0 = proxies[0].asMap().?;
+    try testing.expectEqualSlices(u8, "节点 A", p0.get("name").?.asScalar().?);
+    try testing.expectEqualSlices(u8, "p@ss#word", p0.get("password").?.asScalar().?);
+    const ws_opts = p0.get("ws-opts").?.asMap().?;
+    try testing.expectEqualSlices(u8, "/ws", ws_opts.get("path").?.asScalar().?);
+    const headers = ws_opts.get("headers").?.asMap().?;
+    try testing.expectEqualSlices(u8, "example.com", headers.get("Host").?.asScalar().?);
+
+    // flow 语法节点
+    const p1 = proxies[1].asMap().?;
+    try testing.expectEqualSlices(u8, "flow-node", p1.get("name").?.asScalar().?);
+    try testing.expectEqualSlices(u8, "vless", p1.get("type").?.asScalar().?);
+    // 布尔以原始文本保存
+    try testing.expectEqualSlices(u8, "true", p1.get("tls").?.asScalar().?);
 }
 
-test "missing proxies errors" {
-    try testing.expectError(error.MissingProxies, parseProxies(testing.allocator, "port: 80\n"));
+test "parse anchors and aliases" {
+    const text =
+        \\proxies:
+        \\  - &base
+        \\    name: a
+        \\    type: ss
+        \\    server: 1.2.3.4
+        \\    port: 8388
+        \\  - *base
+        \\
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const doc = try parse(arena, text);
+    try testing.expect(doc.problem == null);
+    const proxies = doc.root.asMap().?.get("proxies").?.asList().?;
+    try testing.expectEqual(@as(usize, 2), proxies.len);
+    // 别名解析到同一份内容
+    try testing.expectEqualSlices(u8, "a", proxies[1].asMap().?.get("name").?.asScalar().?);
+    try testing.expectEqualSlices(u8, "ss", proxies[1].asMap().?.get("type").?.asScalar().?);
 }
 
-test "crlf and empty lines" {
-    const text = "proxies:\r\n  - name: a\r\n    type: ss\r\n\r\n";
-    const nodes = try parseProxies(testing.allocator, text);
-    defer {
-        for (nodes) |n| testing.allocator.free(n.fields);
-        testing.allocator.free(nodes);
-    }
-    try testing.expectEqual(@as(usize, 1), nodes.len);
-    try testing.expectEqualSlices(u8, "a", getField(nodes[0], "name").?);
+test "parse failure produces problem" {
+    const text = "proxies:\n  - name: [unclosed\n";
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const doc = try parse(arena, text);
+    try testing.expect(doc.problem != null);
 }
 
-fn getField(node: Node, key: []const u8) ?[]const u8 {
-    for (node.fields) |f| {
-        if (std.mem.eql(u8, f.key, key)) return f.value;
-    }
-    return null;
+test "invalid alias errors" {
+    const text = "proxies:\n  - *undefined\n";
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try testing.expectError(error.InvalidAnchor, parse(arena, text));
 }

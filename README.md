@@ -1,18 +1,21 @@
 # node2outbound
 
-把 [clash](https://github.com/Dreamacro/clash) 配置文件中的节点（`proxies:`）转换为 [sing-box](https://github.com/SagerNet/sing-box) `outbounds` 配置的 Zig CLI 工具。
+把 [clash](https://github.com/Dreamacro/clash) 配置（订阅链接 / 本地完整配置）中的节点（`proxies:`）转换为 [sing-box](https://github.com/SagerNet/sing-box) `outbounds` 配置的 Zig CLI 工具。
 
 ```bash
 node2outbound -i clash.yaml -o outbounds.json
 cat clash.yaml | node2outbound > outbounds.json
+curl -sL "https://example.com/sub" | node2outbound > outbounds.json
 ```
 
 ## 特性
 
-- 纯 Zig 实现，无运行时依赖，单二进制
-- 零第三方库：自带轻量 YAML 子集解析器（只解析本项目需要的部分）
+- 纯 Zig 单二进制，无运行时依赖（YAML 解析用 vendored libyaml，MIT，编译进产物）
+- 完整 YAML 1.1 解析：嵌套 map（`ws-opts` / `reality-opts` / `headers`）、flow 语法（`- {name: x}`）、锚点/别名、任意缩进、注释、CRLF
 - 支持 stdin/stdout 管道，方便与 `jq` 等工具组合
-- 不支持的节点类型自动跳过并提示，不影响其余节点
+- 传输层与 TLS 细节字段完整映射（见下表）
+- 表达不了的节点自动跳过并在 stderr 报告原因，不影响其余节点
+- tag 重复自动加 `-2` / `-3` 后缀（sing-box 要求 tag 唯一）
 
 ## 构建
 
@@ -49,24 +52,45 @@ cat clash.yaml | node2outbound | jq -r '.[].tag'
 
 输出是一段 JSON 数组，可直接粘到 sing-box 配置的 `outbounds` 字段，或与 `sing-box merge` 组合使用。
 
+## 行为契约
+
+- **跳过策略**：节点使用工具无法表达的协议 / 传输层 / 字段（如 `ssr`、`v2ray-plugin`、未知的 `ws-opts` 键、`network: kcp`）时，该节点被跳过并计数，**绝不输出语法合法但线上不通的配置**。跳过明细（名称 + 原因）写入 stderr。
+- **退出码**：`0` = 成功产出 outbounds（部分节点被跳过时仍为 0）；`1` = 硬失败（输入/解析错误，或没有任何节点可转换）。
+- **tag 去重**：重复 name 依次追加 `-2`、`-3`……（若 `-2` 已被占用则顺延）。
+
 ## 类型映射
 
 | clash type | sing-box type | 字段映射 |
 |------------|---------------|----------|
-| `ss` | `shadowsocks` | `cipher` → `method`，`password` |
-| `vmess` | `vmess` | `uuid`，`alterId` → `alter_id` |
-| `trojan` | `trojan` | `password`，`sni` → `tls.server_name` |
-| `hysteria2` / `hy2` | `hysteria2` | `password`，`sni` → `tls.server_name` |
-| `vless` | `vless` | `uuid`，`tls` / `sni` |
+| `ss` / `shadowsocks` | `shadowsocks` | `cipher` → `method`，`password`，`plugin: obfs-local` → `plugin` + `plugin_opts`（`obfs=http/tls;obfs-host=…`） |
+| `vmess` | `vmess` | `uuid`，`cipher`（非 auto）→ `security`，`alterId`（非 0）→ `alter_id` |
+| `trojan` | `trojan` | `password`，恒输出 `tls` 块 |
+| `hysteria2` / `hy2` | `hysteria2` | `password`（必填），`obfs: salamander` → `obfs`，`up`/`down` → `up_mbps`/`down_mbps` |
+| `vless` | `vless` | `uuid`，`flow`（如 `xtls-rprx-vision`） |
 
-暂不支持（会跳过并计数）：`ssr`、`snell`、`tuic`、`wireguard`、`hysteria` 以及 `ws-opts` / `network` / `client-fingerprint` 等传输层细节字段。
+### 传输层（`network`）
+
+| clash network | sing-box transport |
+|---------------|--------------------|
+| `ws` | `ws`：`ws-opts.path` → `path`，`ws-opts.headers` → `headers`，`ws-opts.max-early-data` / `early-data-header-name` → `max_early_data` / `early_data_header_name`（vless），旧式平铺 `ws-path` / `ws-headers` 同样支持 |
+| `grpc` | `grpc`：`grpc-opts.grpc-service-name` → `service_name` |
+| `http` / `h2` | `http`：`http-opts.path` / `method` / `headers` |
+
+### TLS 与安全
+
+- `sni` / `servername` / `server-name` → `tls.server_name`；`skip-cert-verify` → `tls.insecure`
+- `client-fingerprint` → `tls.utls.fingerprint`；`alpn` → `tls.alpn`
+- vless `reality-opts.public-key` / `short-id` → `tls.reality`（`reality-opts.server-name` 并入 `server_name`）
+
+### 跳过（不支持的节点特性）
+
+`ssr`、`snell`、`tuic`、`wireguard`、`hysteria`，`ss` 的 `v2ray-plugin` 等插件，`network: kcp` 等未知传输，`ws-opts.v2ray-http-upgrade`，以及 ws/grpc/http/reality opts 中的未知字段——一律跳过并报告。
 
 ## Roadmap
 
-- [ ] 传输层字段（`ws` / `grpc` / `http` 的 `ws-opts` 等）
-- [ ] `ssr`、`tuic`、`hysteria` 支持
-- [ ] sing-box `tag` 去重 / 前缀规范化
-- [ ] 输出为完整 sing-box 配置模板（而非仅 outbounds 数组）
+- [ ] `ssr`、`tuic`、`hysteria`、`wireguard`、`snell` 支持
+- [ ] `ws-opts.v2ray-http-upgrade`（httpupgrade 传输）
+- [ ] 输出为完整 sing-box 配置模板（含 proxy-groups 转换）
 
 ## 相关项目
 
@@ -75,4 +99,4 @@ cat clash.yaml | node2outbound | jq -r '.[].tag'
 
 ## License
 
-MIT
+MIT（vendored libyaml 亦为 MIT，见 `vendor/libyaml/LICENSE`）
