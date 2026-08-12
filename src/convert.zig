@@ -766,9 +766,9 @@ fn extractHeaders(arena: std.mem.Allocator, hdrs: yaml.Map) Error!?StringMap {
     return hm;
 }
 
-/// 把 outbounds 以 JSON 数组形式写入 writer（末尾带换行）。
+/// 把 outbounds 以 JSON 数组形式写入 writer（缩进 2 空格，末尾带换行）。
 pub fn writeOutbounds(writer: *std.Io.Writer, outbounds: []const Outbound) !void {
-    try writer.print("{f}\n", .{std.json.fmt(outbounds, .{})});
+    try writer.print("{f}\n", .{std.json.fmt(outbounds, .{ .whitespace = .indent_2 })});
 }
 
 fn getStr(map: yaml.Map, key: []const u8) ?[]const u8 {
@@ -824,13 +824,21 @@ fn convertText(
     return try convert(arena, proxies, skipped);
 }
 
-/// 把 outbounds 序列化为 JSON 字符串（用于子串断言）。
+/// 把 outbounds 序列化为紧凑 JSON 字符串（用于子串断言）。
+/// writeOutbounds 输出的是缩进格式；这里先解析再紧凑序列化，
+/// 使断言与缩进无关，同时验证 writeOutbounds 产出的是合法 JSON。
 fn jsonOf(arena: std.mem.Allocator, out: []const Outbound) ![]const u8 {
     var buf: [16384]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = std.Io.Writer.fromWriter(fbs.writer());
     try writeOutbounds(w, out);
-    return try arena.dupe(u8, fbs.getWritten());
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, fbs.getWritten(), .{});
+    defer parsed.deinit();
+    var out_buf: [16384]u8 = undefined;
+    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    const out_w = std.Io.Writer.fromWriter(out_fbs.writer());
+    try out_w.print("{f}", .{std.json.fmt(parsed.value, .{})});
+    return try arena.dupe(u8, out_fbs.getWritten());
 }
 
 test "ss with ws transport and headers" {
