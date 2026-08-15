@@ -771,6 +771,28 @@ pub fn writeOutbounds(writer: *std.Io.Writer, outbounds: []const Outbound) !void
     try writer.print("{f}\n", .{std.json.fmt(outbounds, .{ .whitespace = .indent_2 })});
 }
 
+/// 收集 outbounds 的所有 tag（保持原顺序），跳过与 `group_name` 相同的 tag。
+/// 用于快速导出 selector 组的 outbounds 列表。
+pub fn collectTags(
+    arena: std.mem.Allocator,
+    outbounds: []const Outbound,
+    group_name: []const u8,
+) Error![]const []const u8 {
+    var tags: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (outbounds) |ob| {
+        const t = ob.tag();
+        if (!std.mem.eql(u8, t, group_name)) {
+            try tags.append(arena, t);
+        }
+    }
+    return tags.toOwnedSlice(arena);
+}
+
+/// 把 tag 列表以 JSON 字符串数组形式写入 writer（缩进 2 空格，末尾带换行）。
+pub fn writeTagList(writer: *std.Io.Writer, tags: []const []const u8) !void {
+    try writer.print("{f}\n", .{std.json.fmt(tags, .{ .whitespace = .indent_2 })});
+}
+
 fn getStr(map: yaml.Map, key: []const u8) ?[]const u8 {
     const v = map.get(key) orelse return null;
     return v.asScalar();
@@ -828,17 +850,15 @@ fn convertText(
 /// writeOutbounds 输出的是缩进格式；这里先解析再紧凑序列化，
 /// 使断言与缩进无关，同时验证 writeOutbounds 产出的是合法 JSON。
 fn jsonOf(arena: std.mem.Allocator, out: []const Outbound) ![]const u8 {
-    var buf: [16384]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = std.Io.Writer.fromWriter(fbs.writer());
-    try writeOutbounds(w, out);
-    const parsed = try std.json.parseFromSlice(std.json.Value, arena, fbs.getWritten(), .{});
+    var buf: [32768]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeOutbounds(&w, out);
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, w.buffered(), .{});
     defer parsed.deinit();
-    var out_buf: [16384]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
-    const out_w = std.Io.Writer.fromWriter(out_fbs.writer());
+    var out_buf: [32768]u8 = undefined;
+    var out_w: std.Io.Writer = .fixed(&out_buf);
     try out_w.print("{f}", .{std.json.fmt(parsed.value, .{})});
-    return try arena.dupe(u8, out_fbs.getWritten());
+    return try arena.dupe(u8, out_w.buffered());
 }
 
 test "ss with ws transport and headers" {
@@ -1103,8 +1123,8 @@ test "tag dedup appends -2 suffix" {
 
     try testing.expectEqualSlices(u8, "same", out[0].tag());
     try testing.expectEqualSlices(u8, "same-2", out[1].tag());
-    // 已存在的 same-2 不冲突，第三个顺延为 same-3
-    try testing.expectEqualSlices(u8, "same-3", out[2].tag());
+    // 真节点也叫 same-2：与第二个节点 dedup 出的 same-2 撞车，追加后缀为 same-2-2
+    try testing.expectEqualSlices(u8, "same-2-2", out[2].tag());
 }
 
 test "vmess alter_id zero omitted, nonzero kept" {
@@ -1205,4 +1225,55 @@ test "hy2 with sni emits tls block even without tls flag" {
 
     const json = try jsonOf(arena, out);
     try testing.expect(std.mem.indexOf(u8, json, "\"tls\":{\"enabled\":true,\"server_name\":\"hy.example.com\"}") != null);
+}
+
+test "collectTags skips group name and preserves order" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const text =
+        \\proxies:
+        \\  - name: select
+        \\    type: ss
+        \\    server: 1.1.1.1
+        \\    port: 8388
+        \\    cipher: aes-256-gcm
+        \\    password: pw
+        \\  - name: node-a
+        \\    type: ss
+        \\    server: 2.2.2.2
+        \\    port: 8388
+        \\    cipher: aes-256-gcm
+        \\    password: pw
+        \\  - name: node-b
+        \\    type: ss
+        \\    server: 3.3.3.3
+        \\    port: 8388
+        \\    cipher: aes-256-gcm
+        \\    password: pw
+        \\
+    ;
+    var skipped: std.ArrayListUnmanaged(SkipInfo) = .empty;
+    const out = try convertText(arena, text, &skipped);
+    try testing.expectEqual(@as(usize, 0), skipped.items.len);
+    try testing.expectEqual(@as(usize, 3), out.len);
+
+    const tags = try collectTags(arena, out, "select");
+    try testing.expectEqual(@as(usize, 2), tags.len);
+    try testing.expectEqualStrings("node-a", tags[0]);
+    try testing.expectEqualStrings("node-b", tags[1]);
+
+    // 组名不在 outbounds 中时，全部保留
+    const all = try collectTags(arena, out, "nonexistent");
+    try testing.expectEqual(@as(usize, 3), all.len);
+    try testing.expectEqualStrings("select", all[0]);
+}
+
+test "writeTagList outputs indented json array" {
+    const tags = [_][]const u8{ "node-a", "node-b" };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeTagList(&w, &tags);
+    try testing.expectEqualStrings("[\n  \"node-a\",\n  \"node-b\"\n]\n", w.buffered());
 }

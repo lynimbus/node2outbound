@@ -29,11 +29,13 @@ zig build -Doptimize=ReleaseSafe
 ## 用法
 
 ```
-node2outbound [-i <clash.yaml>] [-o <outbounds.json>]
+node2outbound [-i <clash.yaml>] [-o <outbounds.json>] [-g [组名]]
 
 选项:
   -i, --input <文件>    输入 clash 配置文件（默认读 stdin）
   -o, --output <文件>   输出 sing-box JSON（默认写 stdout）
+  -g, --group [组名]    只输出 outbounds 的 tag 列表（JSON 数组），跳过与组名相同的 tag；
+                       默认组名 select，便于直接插入 selector 组的 outbounds
   -h, --help            显示帮助并退出
 ```
 
@@ -46,8 +48,11 @@ node2outbound -i config.yaml -o outbounds.json
 # 订阅链接 → sing-box 配置片段（配合 curl）
 curl -sL "https://example.com/sub" | node2outbound > outbounds.json
 
-# 只提取 tag，方便和 jq 组合
-cat clash.yaml | node2outbound | jq -r '.[].tag'
+# 快速导出除 select 外的所有 tag，直接粘进 sing-box selector 组的 outbounds
+curl -sL "https://example.com/sub" | node2outbound -g
+
+# 自定义组名：跳过与组名相同的 tag（此处跳过名为 auto 的节点）
+cat clash.yaml | node2outbound --group auto
 ```
 
 输出是一段 JSON 数组，可直接粘到 sing-box 配置的 `outbounds` 字段，或与 `sing-box merge` 组合使用。
